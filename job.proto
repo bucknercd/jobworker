@@ -1,0 +1,123 @@
+syntax = "proto3";
+
+package jobworker.v1;
+
+option go_package = "github.com/yourorg/jobworker/api/jobworker/v1;jobworkerv1";
+// import "google/rpc/status.proto";
+// import "google/rpc/error_details.proto";
+
+// ================= Enums =================
+
+enum JobStatus {
+  JOB_STATUS_UNSPECIFIED = 0;
+  JOB_STATUS_RUNNING     = 1;
+  JOB_STATUS_EXITED      = 2;
+  JOB_STATUS_STOPPED     = 3;
+  JOB_STATUS_FAILED      = 4;
+}
+
+// For advisory/warning signals that are not fatal errors.
+enum StreamAdvisory {
+  STREAM_ADVISORY_UNSPECIFIED = 0;
+  STREAM_ADVISORY_TRUNCATED   = 1; // File was truncated; server will reset offset to 0
+}
+
+// ================= Limits =================
+// If ANY field is non-empty, the server applies limits.
+// Examples (parsed server-side; strings are free-form but documented here):
+//   cpu:        "500m" (500 milli-cores)
+//   max_memory: "1G" | "200M"
+//   max_io:     "low" | "med" | "high" (low, medium, high priority; "high" is unlimited)
+message ResourceLimits {
+  string cpu        = 1; // empty => not specified
+  string max_memory = 2; // empty => not specified
+  string max_io     = 3; // empty => not specified
+}
+
+// ================= Requests / Responses =================
+
+message JobMetadata {
+  string    user      = 1;
+  string    role      = 2;
+  string    group     = 3;
+  JobStatus status    = 4;
+  int32     exit_code = 5;
+  int64     ttl       = 6;
+}
+
+message StartJobRequest {
+  string           executable = 1; // "ls" or "/usr/bin/ls"
+  repeated string  args       = 2; // ["-lah", "/"]
+  ResourceLimits   limits     = 3; // Any non-empty field => apply limits
+}
+
+message StartJobResponse {
+  string job_id = 1; // 8-char, lexicographically sortable
+}
+
+message StopJobRequest {
+  string job_id = 1;
+}
+
+message StopJobResponse {
+  JobMetadata metadata = 1;
+}
+
+message GetStatusRequest {
+  string job_id = 1;
+}
+
+message GetStatusResponse {
+  string      job_id   = 1;
+  JobMetadata metadata = 2;
+}
+
+// ================= Streaming (with optional offsets) =================
+//
+// Offsets are in "chunk units". Server multiplies:
+//   start_byte = offset * chunk_size_bytes
+// If truncation invalidates the offset, server resets to the current beginning
+// and sends an advisory in-band (see StreamOutputResponse).
+
+message StreamOutputRequest {
+  string  job_id        = 1;
+  bool    stream_stderr = 2; // If true, stream stderr; if false or unset (default), stream stdout
+  bool    tail          = 3; // Follow in real-time; if true and offset is set, start at offset then continue following
+  optional uint64 offset = 4; // Optional client offset (chunk units); if unset, treated as 0
+}
+
+
+message StreamOutputResponse {
+  // Data
+  bytes  chunk       = 1; // Up to server chunk size (e.g., 32KB)
+  uint64 new_offset  = 2; // The next chunk index the client should request (last_sent_offset + 1)
+
+  // Truncation + advisories (non-fatal)
+  bool           file_truncated   = 4; // True when truncation detected
+  StreamAdvisory advisory         = 7; // Indicates if truncated or not
+  string         advisory_message = 8; // Human-readable context
+
+  // Stream/housekeeping
+  bool   end_of_stream = 9;  // True when no more output from job (EOF or stream closed)
+  uint32 server_chunk_size_bytes = 10; // Server's configured max chunk size (e.g., 32768). Actual bytes per message = len(chunk)
+}
+
+// ================= Service =================
+//
+// Error model (gRPC status codes):
+//   INVALID_ARGUMENT     bad executable/args/limits; bad offset
+//   PERMISSION_DENIED    caller not allowed (wrong group/role) or command not allowed
+//   NOT_FOUND            unknown job_id OR TTL GC already removed artifacts
+//   FAILED_PRECONDITION  environment not ready (e.g., cgroup fs missing)
+//   RESOURCE_EXHAUSTED   max jobs/procs/disk guardrails hit
+//   UNAVAILABLE          service not ready/backpressure
+//   INTERNAL             unexpected server error
+//
+// StreamOutput uses status trailers for terminal errors after stream start.
+
+service JobWorker {
+  rpc StartJob     (StartJobRequest)      returns (StartJobResponse);
+  rpc StopJob      (StopJobRequest)       returns (StopJobResponse);
+  rpc GetStatus    (GetStatusRequest)     returns (GetStatusResponse);
+  rpc StreamOutput (StreamOutputRequest)  returns (stream StreamOutputResponse);
+}
