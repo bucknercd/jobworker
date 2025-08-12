@@ -76,8 +76,6 @@ message StreamOutputRequest {
 
 message StreamOutputResponse {
   bytes  chunk                   = 1; // up to server chunk size (e.g., 32KB)
-  bool   end_of_stream           = 2; // true on final message before stream completes
-  uint32 server_chunk_size_bytes = 3; // informative; constant across the stream
 }
 
 // ================= Service =================
