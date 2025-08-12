@@ -1,0 +1,99 @@
+syntax = "proto3";
+
+package jobworker.v1;
+
+option go_package = "github.com/bucknercd/jobworker/proto/gen/jobpb;jobpb";
+
+// ================= Enums =================
+
+enum JobStatus {
+  JOB_STATUS_UNSPECIFIED = 0;
+  JOB_STATUS_RUNNING     = 1;
+  JOB_STATUS_EXITED      = 2;
+  JOB_STATUS_STOPPED     = 3;
+  JOB_STATUS_FAILED      = 4;
+}
+
+// ================= Limits =================
+// If fields are empty, the server applies its DEFAULT limits.
+// Examples:
+//   cpu        = "500m"            // millicores
+//   memory_max = "100M"            // bytes w/ suffix
+//   io_class   = "low" | "med" | "high"
+message ResourceLimits {
+  string cpu         = 1; // e.g. "500m"
+  string memory_max  = 2; // e.g. "100M"
+  string io_class    = 3; // e.g. "low"
+}
+
+// ================= Requests / Responses =================
+
+message JobMetadata {
+  string    user      = 1;
+  string    role      = 2;
+  string    group     = 3;
+  JobStatus status    = 4;
+  int32     exit_code = 5; // present when status is EXITED/FAILED
+}
+
+message StartJobRequest {
+  string           executable = 1;            // "ls" or "/usr/bin/ls"
+  repeated string  args       = 2;            // ["-lah", "/"]
+  ResourceLimits   limits     = 3;            // empty => apply server defaults
+}
+
+message StartJobResponse {
+  string job_id = 1; // 8-char, lexicographically sortable
+}
+
+message StopJobRequest {
+  string job_id = 1;
+}
+
+message StopJobResponse {
+  string      job_id   = 1;
+  JobMetadata metadata = 2;
+}
+
+message GetStatusRequest {
+  string job_id = 1;
+}
+
+message GetStatusResponse {
+  string      job_id   = 1;
+  JobMetadata metadata = 2;
+}
+
+// ================= Streaming (no offsets; always from beginning) =================
+//
+// Server streams bytes from the beginning of the selected stream (stdout by default)
+// and continues in real-time until the writer closes the FD (job exit) or the call ends.
+
+message StreamOutputRequest {
+  string job_id        = 1;
+  bool   stream_stderr = 2; // false (default) = stdout, true = stderr
+}
+
+message StreamOutputResponse {
+  bytes  chunk                   = 1; // up to server chunk size (e.g., 32KB)
+  bool   end_of_stream           = 2; // true on final message before stream completes
+  uint32 server_chunk_size_bytes = 3; // informative; constant across the stream
+}
+
+// ================= Service =================
+//
+// Error model (gRPC status codes):
+//   INVALID_ARGUMENT     bad executable/args/limits
+//   PERMISSION_DENIED    caller not allowed (role/group/allowlist)
+//   NOT_FOUND            unknown job_id
+//   FAILED_PRECONDITION  environment not ready (e.g., cgroup FS missing)
+//   RESOURCE_EXHAUSTED   guardrails hit (max jobs, etc.)
+//   UNAVAILABLE          service not ready/backpressure
+//   INTERNAL             unexpected server error
+
+service JobWorker {
+  rpc StartJob     (StartJobRequest)      returns (StartJobResponse);
+  rpc StopJob      (StopJobRequest)       returns (StopJobResponse);
+  rpc GetStatus    (GetStatusRequest)     returns (GetStatusResponse);
+  rpc StreamOutput (StreamOutputRequest)  returns (stream StreamOutputResponse);
+}

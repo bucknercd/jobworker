@@ -50,10 +50,10 @@ Implement a secure gRPC-based job worker service that allows clients to start, s
 
 ### Included
 
-- Start/stop/query status of arbitrary processes.
+- Start/stop/query status of arbitrary processes. Note: Will **always** stream messages in chunks from begining of the output
 - Stream process stdout/stderr. Data will persist across server reboots.
-- Semi-persistent storage of job stream info. A TTL (time to live) for exited process will be established
-- Terminate child processes correctly, no orphans or zombies
+- Semi-persistent storage of job stream info
+- Terminate child processes correctly, no orphans or zombies (done via `cgroups` and `setpgid`)
 - Set resource limits (CPU, memory, I/O) using cgroups v2 (manual implementation)
 - Secure gRPC communication via mTLS (strong cipher suites)
 - Simple authorization via client CA
@@ -97,22 +97,19 @@ Implement a secure gRPC-based job worker service that allows clients to start, s
   - I will not implement a rate limiting middleware but am aware one would be beneficial to have. This would prevent resource exhaustion. For example, making many connections and just leaving all of them open by starting a TCP handshake but never closing it.
 - **Secure Commands Allowlist**
   - In order to prevent a user from destroying or exploiting the system there **must** be a command allowlist, for users of type `user`, and a denylist for users of type `admin`.
-- **Resource Exhaustion**
-  - To prevent resource exhaustion, launching a job and streaming output will each have a goroutine, apart from initial gRPC server, so they can be working asynchronously. There will be limits with regards to the amount of `jobs` , which have a one to one mapping to goroutines so as to prevent a goroutine explosion or a fork bomb.
-  - The stdout.log and stderr.log files will be limited (refer to limits below) ie. 100MB, 20MB
-  - Disk usage will be limited as well (refer to limits below) ie. 80%
-  - Memory will be limited (refer to limits below) ie. 8GB
 - **Logging**
   - The server will maintain logs to disk to keep track of all events and to see who has tried to do what to be able to have visibility 
 ---
 
-## CLI Examples
-### Offset Notes
-- The `--offset` argument specifies the `chunk number`. The **actual** byte position is `offset x chunk size`. For example, if `chunk size` is `32KB` then `--offset=2` means that the **actual** byte position is `64KB`
-- If `--offset` is **not** specified , it will default to **0**
-### Tail Note
-- If `--tail` is **not** specified, the server streams from the requested offset until **EOF**, emitting one or more messages (each up to `streamOutputChunkSizeKB`). If the file is smaller than a chunk, you’ll just get the smaller, final chunk.
 
+## CLI Examples
+### Streaming Note
+- All the `stream` commands have `tail` like functionality. This means that if the job is still running, the stream will continue to follow the output in real-time. If the job has exited, the stdout and stderr file descriptors will be closed and the stream will end. An advisory will be sent to user denoting the stream has ended.
+### Limits Default
+- If no limits are specified, the job will run with default cgroup limits:
+  - CPU: 500m (500 milli-cores)
+  - Memory: 100M
+  - I/O: low
 ```bash
 # Start a job
 jobctl start --cmd "ls / -lah"
@@ -124,25 +121,21 @@ jobctl start \
   --mem=100M \
   --io=low
 
-# Stream the output (stdout) (currently running or terminated but within TTL)
+# Stream the output (stdout)
 jobctl stream --id=xxxxxxxx
 
 # Stream the output (stderr)
 jobctl stream --id=xxxxxxxx --stderr
 
 # Stream the last output of a currently running job (stdout)
-jobctl stream --id=xxxxxxxx --tail 
-
-# Stream from offset 10 (chunk-based; ie. 10 × 32KB = 320KB into file)
-jobctl stream --id=xxxxxxxx --offset 10
+jobctl stream --id=xxxxxxxx
 
 # Get job status
 jobctl status --id=xxxxxxxx
 
 # Stop a job
-jobctl stop --id xxxxxxxx
+jobctl stop --id=xxxxxxxx
 ```
-
 
 ---
 ## Component Overview
@@ -151,14 +144,13 @@ jobctl stop --id xxxxxxxx
 
 | Function                                        | Description                                             |
 | ----------------------------------------------- | ------------------------------------------------------- |
-| `StartJob(cmd []string, limits ResourceLimits)` | Performs resource exhaustion checks. Generates an id and creates, then starts a job with cgroup limits, or without, via `joblib`. Adds it to its internal job mapping. Returns a jobid or a resource exhaustion message |
-| `StopJob(id string)`                         | Stops job via `joblib`. Records a TTL (time to live) indicating when the job's resources (logs, metadata) should be kept around for. Important for reading Stdout and Stderr from exited job(s) |
+| `StartJob(cmd []string, limits ResourceLimits)` | Generates an id and creates, then starts a job with cgroup limits via `joblib`. Adds it to its internal job mapping. Returns a jobid. |
+| `StopJob(id string)`                         | Stops job via `joblib`. Makes sure all cgroup resources are released and all processes terminated. |
 | `GetStatus(id string)`                       | Returns Job status protobuf response via `joblib`. |
-| `StreamOutput(id string, streamStderr bool, offset uint64, tailOutput bool)` | Streams output (stdout or stderr) to the client in chunks size `32KB` (from config). The default is to stream stdout. The client should provide an offset. The offset state is handled by the client. The server does not handle the offset. The offset is in increments of the `chunk size`  |
+| `StreamOutput(id string, streamStderr bool)` | Streams output (stdout or stderr) to the client in `chunk size` (from config). The default is to stream stdout. All messages will be retrieved until the the file descriptor(s) are closed. |
 
 #### Notes
-- A `JobController` will be implemented to handle `StartJob` and `StreamOutput` as these will get their own dedicated goroutines. The amount of goroutines will be limited. This is so the server won't be overwhelmed by requests.
-- TTL (Time to Live) will be a Unix epoch timestamp. Eviction time, or the Unix epoch timestamp in the future, will be 8 hours from when job is run.
+- A `JobController` will be implemented to handle `StartJob` and `StreamOutput` as these will get their own dedicated goroutines.
 - The `cmd` parameter is actually composed of an executable part plus its argument(s). For example when `cmd` is "ls -lah". The executable part is `ls` and the argument is `-lah`. These are passed in separately to the `joblib` underlying package.
 - Location of job output: `/var/lib/jobs/<jobid>/(stdout|stderr).log`
 - Location of job metadata: `/var/lib/jobs/<jobid>/metadata`
@@ -181,20 +173,9 @@ jobctl stop --id xxxxxxxx
     StatusStopped
     StatusFailed
 ```
-- Limits
-  - These are set via a config. An example is provided below
+- Config
+### Note: These will be hardcoded for simplicity but would normally be in a config file or env vars
 ```bash
-    # launching a process
-    maxJobsPerNode = 8 // limit the amount of goroutines 
-    maxProcsPerJob = 12 // limit the amount of child procs
-    maxMemoryPerNodeGB = 8 // limit RAM
-    maxDiskPercentagePerNode = 80 // limit disk usage (root partition)
-
-    # truncating stdout/stderr files
-    maxStdoutFileSizeMB = 100
-    maxStderrFileSizeMB = 20
-    truncatePercentage = 10
-
     # streaming output
     streamOutputChunkSizeKB = 32
 
@@ -228,16 +209,17 @@ func generateID() string {
 #### Details
 
 ##### StartJob
-- Checks disk space on partition where `/var/lib` is at (I am assuming root `/`). We need to have 15% of that partition available
-- Controller will check if all the limit requirements are ok. Refer to **limits** above.
 - Generate unique job id
 - JobController via `joblib` creates a job
-  - with limits or without limits
 - write job metadata out to a file
 - return jobid
 
 #### StopJob
-- Terminates the job via `joblib` if it is still running and writes a Unix epoch timestamp as its TTL. 
+- Terminates the job via `joblib`
+- This closes stdout/stderr file descriptors which will be used to signal the end of the stream
+- Cleans up cgroup resources
+- Updates job metadata with exit code and status
+- Removes job from internal mapping
 
 #### StreamOutput Visual Logic
 ```bash
@@ -283,37 +265,25 @@ func generateID() string {
 ```
 ##### `StreamOutput`
 - **Initial note**: The majority of this logic will be implemented in the `joblib` but `StreamOutput` will have this functionality.
-- `StreamOutput` will **only** stream from job output that is written to disk. Stdout and Stderr will be written to disk by JobController via `joblib` itself upon invocation of `StartJob`. During the call to `StreamOutput` if the process has exited and the TTL has expired, those files will be deleted by this `manager` package and nothing will be streamed to client. Client will receive some message indicating that the job has expired. (**manager**)
+- `StreamOutput` will **only** stream from job output that is written to disk. Stdout and Stderr will be written to disk by JobController via `joblib` itself upon invocation of `StartJob`. A closed file descriptor (stdout/stderr) will signify the end of the file/stream. An advisory will be sent to client when this occurs.
 - Each `StreamOutput` call spawns a goroutine that reads from the persisted log file and pushes content to a **client-specific Go channel**, which is then streamed via gRPC. (**joblib**)
-- `StreamOutput` is called, per client, and the pertinent file with stdout/stderr information will be read from and sent to a channel for streaming purposes. Now, the process could still be running and that's fine or it could be terminated but still within its TTL and client could still stream output. (**joblib**) 
-- `Tailing Output`: Output can be "tailed" if a process is still running. (**joblib**)
-- `Limiting Output`: stdout.log and stderr.log MUST have a max size or this could represent an issue if for some reason a process is very long lived and produces much output or never stops producing output. The max size can be set to `100MB` for stdout and `20MB` for stderr. Since the files have size limits they can be truncated so during truncation the file will be **locked** so ONLY writes can happen during that time preventing a race condition. The strategy will be to keep the last 10%. `10MB` (stdout), `2MB`(stderr) of a file in this case. A message indicating truncation will be received by the client. (**joblib**). **Note**: These limits can be changed. Refer to limits section above.
--  `Replay`: A client will be able to stream any output of a job even after the job has exited as long as it's within its TTL (time to live). (**joblib**)
-- `Offsets`: If an offset is provided by the client it will be calculated by multiplying by `chunk size`. The client will be returned the **chunk** from the particular offset. Furthermore, if the file with stdout/stderr were to be truncated during the client's request and the offset were to be invalid, then offset 0 will be chosen from truncated file and an **truncated** message prepended letting the client know. If the offset is valid but file has been **truncated** the same behavior as previously described will happen as well. 
-  - If `--tail` and `--offset` are both provided, then the output will be streamed in real-time from the offset. The client will receive chunks of data starting from the offset and continuing until the end of the file. If the `offset` is invalid then the client will receive a message indicating that the file has been truncated and the offset is now 0.
-- `streamOutputChunkSizeKB`: The `StreamOutput` call will stream the data in a particular chunk size and the client will keep track of any particular offset it's on and on subsequent calls, it will just auto increment said offset. Only if an offset is specifically set, then will the client potentially `skip ahead` or `look back` at output. 
-
+- `StreamOutput` is called, per client, and the pertinent file with stdout/stderr information (chunk size) will be read from and sent to a channel for streaming purposes. Now, the process could still be running or it could be terminated. Each chunk is a message and all messages will be sent until the end of stream advisory is received. (**joblib**) 
+-  `Replay`: A client will be able to stream any output of a job even after the job has exited. (**joblib**)
 
 ##### StreamOutput Requirements
-- Clients stream either:
-  - From the **beginning of the file** (or new start after truncation).
-  - From an offset if specified
-  - Or both. They can **tail** the output in real-time plus use an offset
-- Only the **latter portion of the file** is kept (after size limit reached). (last 10%. Refer to limits section above. Can be modified)
+- Clients stream from the **beginning of the output**
 - Support **multiple clients** connecting at different times.
 - Avoid race conditions when jobs are writing and clients are reading.
 - Designed for **CLI usage** via a single `StreamOutput` gRPC call.
 
 
-
- 
 ### 2. `joblib` (Core Library)
 
 | Function             | Description                                             |
 | -------------------- | ------------------------------------------------------- |
-| `Start()`            | Starts a process via setpgid(), takes in an executable and args. Sets job status and executes the process. It also sets up the process' stdout and stderr and to be read from and written to files on disk. These file names should map up to the job id assigned and also on disk as well. Then wait for job to finish, or be terminated, get its exit status and set it job status as well.
-| `Stop()`             | Get PGID via getpgid() and send KILL signal to it. If there is a cgroup created, delete it. Set job status.
-| `Status()`           | Return the job status response from 
+| `Start()`            | Starts a process via setpgid(), takes in an executable and args. Sets job status, cgroup limits and executes the process. See **Start** for details.  It also sets up the process' stdout and stderr and to be read from and written to files on disk. These file names should map up to the job id assigned and also on disk as well. Then wait for job to finish, or be terminated, get its exit status and set it job status as well.
+| `Stop()`             | Sends `SIGTERM` to the process group for a graceful shutdown. If the process is still running after the timeout, it writes `1` to `/sys/fs/cgroup/jobs/<jobid>/cgroup.kill` to forcefully terminate it and remove the cgroup.
+| `Status()`           | Return the job status response 
 | `Stdout()`           | Returns a buffered channel(1024) which is filled with data previously written to disk
 | `Stderr()`           | Returns a buffered channel(1024) which is filled with data previously written to disk
 | `GetStatusResponse()`| Returns a structured status response with job ID, current state (running, exited, etc.), and exit code (if available). Used by both CLI and gRPC server.
@@ -321,17 +291,34 @@ func generateID() string {
 #### Details
 
 ##### Start (Launching an actual process)
-- Job status will be set to running
-- If a particular job has limits, then a call to the `cgroups` library will be made to create the needed cgroup to limit the process' CPU, Memory or Disk IO.
-- The process is setup by using `setpgid` and setting `uid` and `gid` to `nobody` for normal users. `uid` and `gid` should be `1000` when running as an admin user. The process uses `setpgid` so that it can clean up children processes later if it needs to.
-- The PID of this process is added to its cgroup, if the limits were provided. (This **must** be done in this order)
-- The process' stdout and stderr will be captured and written to stdout and stderr files and any metadata by the root process itself via cmd.StdoutPipe() and cmd.StderrPipe(). The appropriate metadata is written to its location in `/var/lib/jobs/<jobid>/...` as well.
-- The process is then waited on for its exit to reap it and obtain its exitcode. The exitcode will be written to the job metadata.
+- The `Start()` function will take in a command and its arguments, along with resource limits. It will then:
+  - Generate a unique job ID
+  - Create a new process using `exec.Command()` with the following attributes:
+    - `SysProcAttr.Setpgid` = true (start as its own process group leader).
+    - `SysProcAttr.Pdeathsig` = SIGKILL (if the supervisor dies, the child is killed).
+    - `SysProcAttr.Ptrace` = true (child will stop on post-exec SIGTRAP).
+    - `SysProcAttr.Credential` = {Uid,Gid} set to `nobody` for normal users or `1000:1000` for `admin`.
+  - Create a cgroup for the job and apply resource limits
+  - move the process to the cgroup by writing its PID to `/sys/fs/cgroup/jobs/<jobid>/cgroup.procs`
+  - Set up stdout and stderr to write to `/var/lib/jobs/<jobid>/stdout.log` and `/var/lib/jobs/<jobid>/stderr.log`
+  - Start the process (which will be initally stopped due to `SysProcAttr.Ptrace`)
+  -  Wait for it to finish(detach from ptrace), capturing its exit code
+
+```go
+    cmd := exec.Command(cmdName, cmdArgs...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Setpgid:   true, // Set process group ID to the same as the process ID for cleanup
+		Pdeathsig: syscall.SIGKILL, // Ensure child processes are killed if the parent dies
+		Ptrace:    true, // Allow ptrace so we can move the process to a cgroup preventing it from escaping
+		Credential: &syscall.Credential{ // set uid and gid to nobody for normal users
+            Uid: uid, Gid: gid,         // If running as admin user, set uid and gid to 1000
+		},
+	}
+```
 ##### Security note about Start()
 - The executable can be a full path or a bare command name (e.g., `ls` vs. `/usr/bin/ls`). This possibly introduces a `PATH` injection vulnerability, since the system will resolve the executable by searching `$PATH`. The design acknowledges this risk and permits it for this iteration, but future revisions should require full, trusted paths or implement strict validation.
 
 #### Key Subcomponents: (other potential packages)
-
 - `devinfo`: A helper to provide device info. Like what /dev to set the IO cgroup limits on. This will be determined by grabbing the device where the root (/) dir is mounted.  (ie. /dev/sda might be 8:0)
 - `cgroups`: Actually creates and deletes cgroups v2 limits (implementation described below)
 - `resources`: A helper package to abstract away all the many low level resource requirements (TBD if needed)
@@ -351,7 +338,10 @@ func generateID() string {
     - cpu.max is written as "<quota> <period>" in microseconds. Typical period is 100000µs (100ms), and quota ≤ period.
   - set `io.max` to "<device> <rbps> <wbps>" (3 tokens). An example: `8:0 rbps=1048576 wbps=1048576`
     - Note: The major(8) and minor(0) will try to be determined based on device where the root(/) directory is mounted on.
-3. After the process has been launched obtain its `pid` and write it out to `cgroup.procs` as text
+3. After the process has been launched, but paused by `SIGSTOP`, obtain its `pid` and write it out to `cgroup.procs`
+  - This will add the process to the cgroup and apply the limits.
+4. When the process exits, delete the cgroup directory `/sys/fs/cgroup/jobs/<jobid>`.
+5. If the process is still running, write `1` to `/sys/fs/cgroup/jobs/<jobid>/cgroup.kill` to forcefully kill the process and remove the cgroup.
 
 
 ### 3. `server` (gRPC API)
@@ -365,11 +355,12 @@ func generateID() string {
   - mTLS setup using TLS 1.3
   - authorization done via CA. O=admin|user
 
-### 4. `cli` (JobCtl)
+### 4. `CLI` (JobCtl)
 
 - Command line interface using [`spf13/cobra`](https://github.com/spf13/cobra)
 - gRPC TLS client with `x509` cert loading
 - Usage is listed above
+- On `StreamOutput`, the CLI will read in chunks of `streamOutputChunkSizeKB` and when the end of the stream is reached, it will stop reading and exit. If the job is still running, it will continue to read in real-time until the job exits.
 
 
 ### 5. AuthN/Z
