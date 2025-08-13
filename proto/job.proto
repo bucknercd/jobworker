@@ -19,8 +19,9 @@ enum JobStatus {
 // Output target to stream.
 // Defaults to STDOUT if not set.
 enum StreamTarget {
-    STDOUT = 0;
-    STDERR = 1;
+    STREAM_TARGET_UNSPECIFIED = 0; // No target explicitly set
+    STDOUT = 1;
+    STDERR = 2;
 }
 
 // ================= Limits =================
@@ -100,6 +101,8 @@ message StreamOutputRequest {
   StreamTarget target  = 2; // Optional; defaults to STDOUT
 }
 
+// Chunks are binary-safe and may split at arbitrary byte offsets.
+// Clients are responsible for reassembling and decoding as needed.
 message StreamOutputResponse {
   bytes  chunk         = 1; // Up to server chunk size (e.g., 32KB)
 }

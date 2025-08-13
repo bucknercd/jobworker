@@ -88,7 +88,7 @@ Implement a secure gRPC-based job worker service that allows clients to start, s
   - A user can **only** can perform operations such as stream output from any job as long as they have the job id 
   - Client CA certificates will be stored in the running server's filesystem rather than in a database, to reduce initial implementation complexity.
 - **Shell invocation**
-  - Avoids shell injection; Process execution happens via an `init` binary in a chroot jail.
+  - Avoids shell injection; Process execution happens in a chroot jail.
 - **Job isolation**
   - Cgroups used for resource control (custom implementation)
   - Each job gets its own cgroup directory
@@ -160,14 +160,24 @@ jobctl stop xxxxxxxx
   }
   ```
 
+Exited = process ended normally with exit_code = 0
+Stopped = process terminated via StopJob() or external signal
+Failed = process exited with non-zero code or setup error
+
+
 - Statuses
 ```bash
-    StatusUnknown
-    StatusRunning
-    StatusExited
-    StatusStopped
-    StatusFailed
+    StatusUnknown // initial state
+    StatusRunning // process is running
+    StatusExited // process has exited normally or with an error
+    StatusStopped // process has been stopped
+    StatusFailed // process failed to start or encountered an error even lanching 
 ```
+### Status Flow
+`Unknown` -> `Running` -> `Exited`
+`Unknown` -> `Running` -> `Stopped`
+`Unknown` -> `Failed`
+
 - Server Config
 ### Note: These will be hardcoded for simplicity but would normally be in a config file or env vars
 ```bash
@@ -181,37 +191,10 @@ jobctl stop xxxxxxxx
     chrootRoot = `/opt/jobroot`
 ```
 - Job ID
-  - 16 character length alphanumeric ascii string.
-  - First `6`: fixed-width base36 Unix timestamp (left-padded with 0; if ever longer, use the rightmost 6).
-  - Lexicographically sortable
-  - Last `10`: `crypto-random` [a-z0-9]
-  - Total of 36^10 (3.66 trillion) combinations for the random part
-  - This protects against collisions
+  - will use UUIDv7 (36 character length alphanumeric ascii string) 
 ```go
-const letters = "abcdefghijklmnopqrstuvwxyz0123456789"
-
-func generateID() string {
-    t := strconv.FormatInt(time.Now().Unix(), 36)
-    if len(t) < 6 {
-        t = strings.Repeat("0", 6-len(t)) + t
-    } else if len(t) > 6 {
-        t = t[len(t)-6:] // keep rightmost 6 if it ever grows
-    }
-    return t + randomString(10)
-}
-
-func randomString(n int) string {
-    var sb strings.Builder
-    for i := 0; i < n; i++ {
-        num, _ := rand.Int(rand.Reader, big.NewInt(int64(len(letters))))
-        sb.WriteByte(letters[num.Int64()])
-    }
-    return sb.String()
-}
+id, err := uuid.NewV7()
 ```
-
-- TTL file location: `/var/lib/jobs/<jobid>/ttl`
-- TTL file contents will be very simple. Just an int64 binary representation.
 
 #### Details
 
@@ -277,101 +260,146 @@ func randomString(n int) string {
 - Designed for **CLI usage** via a single `StreamOutput` gRPC call.
 
 
+#### Example Manager API Usage
+```go
+package main
+import (
+    "github.com/buckercd/jobworker/joblib/manager"
+)
+
+func main() {
+	m := manager.NewJobManager(...)
+	jobID, err := m.StartJob([]string{"/bin/sleep", "5"}, joblib.ResourceLimits{CPU: "500m"})
+	status, _ := m.GetStatus(jobID)
+	stream, _ := m.StreamOutput(jobID, false)
+	m.StopJob(jobID)
+}
+```
+
 ### 2. `joblib` (Core Library)
 
 | Function             | Description                                             |
 | -------------------- | ------------------------------------------------------- |
-| `Start()`            | Generates job id, sets a up cgroup, launches an init binary which moves its `pid` into the `cgroup` and uses  replacing itself with the actual target command and args. Then it waits for process to finish, or be terminated, get its exit status and set it job status as well.
-| `Stop()`             | Has cgroup library write `1` to `/sys/fs/cgroup/jobs/<jobid>/cgroup.kill` to forcefully terminate and remove the cgroup.
+| `Start()`            | Creates a cgroup via `cgroup` library, sets up the command with resource limits, and starts the process in a chroot jail. It will also handle logging to stdout/stderr files. The function will return a job ID.
+| `Stop()`             | Has cgroup library write `1` to `/sys/fs/cgroup/jobs/<jobid>/cgroup.kill` to forcefully terminate and then remove the cgroup.
 | `Status()`           | Return the job status response 
 | `GetStatusResponse()`| Returns a structured status response with job ID, current state (running, exited, etc.), and exit code (if available). Used by both CLI and gRPC server.
+
+#### Notes
+- `Go 1.21+` is required for `UseCgroupFD` functionality
+- `CLONE_INTO_CGROUP` is required for the `UseCgroupFD` to work properly. (zero time a process runs outside of the cgroup)
+- `Linux Kernel 5.7+` is required for this functionality
+- No need to write a `pid` to `/sys/fs/cgroup/jobs/<jobid>/cgroup.procs` as `UseCgroupFD` will handle this automatically
 
 #### Details
 
 ##### Start (Launching an actual process)
 - The `Start()` function will take in a command and its arguments, along with resource limits. It will then:
 
-1. **Set Up Cgroup** – Create the job’s cgroup and apply resource limits.
+1. **Set Cgroup**
+  - Create a `cgroup` via `cgroup` library with the provided limits.
+  - Get a file descriptor for the cgroup directory
 
-2. **Setup and Launch Init Binary**
-  - Use exec.Command to setup/start a small `init` helper binary 
+2. **Build the Command**
+    - Open log files for stdout and stderr
+    - Build the command using `exec.Command` with the provided command and arguments using a safe `PATH` environment variable
+
+3. **Use SysProcAttr to set up the child process**
+  - Set `UseCgroupFD` to true and pass the cgroup file descriptor
+  - Set `Chroot` to the chroot jail directory (e.g., `/opt/jobroot`)
+  - Set `Credential` to drop privileges to `nobody:nogroup` (uid/gid 65534)
+  - Set `Pdeathsig` to `SIGKILL` to ensure the child is killed if the parent dies
+  - Set `Setpgid` to true to set the process group ID to its own PID
+
+3. **Start the Process**
+   - Use `cmd.Start()` to start the process in the cgroup and chroot jail
+
+4. **Supervision**
+   - Wait for the child process to exit and capture its exit status.
+   - Delete the cgroup directory after the process exits
+
 ```go
-//Supervisor (parent process)
-//Just starts the wrapper and handles logging; no sandboxing here because the wrapper will do it.
-cmd := exec.Command("/usr/local/bin/init-wrapper", append([]string{jobId, targetCmd}, args...)...)
-cmd.Env = []string{"PATH=/bin:/usr/bin"}
-cmd.Stdout = os.Stdout
-cmd.Stderr = os.Stderr
-cmd.Stdin = nil
+// Go 1.21+ is required for this code to work
+	cgroupPath := os.Args[1]
+	cmdPath := os.Args[2]
+	cmdArgs := os.Args[3:]
 
-if err := cmd.Start(); err != nil {
-	log.Fatalf("failed to start job: %v", err)
-}
+	// 1. Open the cgroup directory
+	cfd, err := syscall.Open(cgroupPath, syscall.O_DIRECTORY|syscall.O_RDONLY, 0)
+	if err != nil {
+		log.Fatalf("failed to open cgroup dir: %v", err)
+	}
+	defer syscall.Close(cfd)
+
+	// 2a. Open log files
+	stdoutFile, err := os.OpenFile("/tmp/stdout.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		log.Fatalf("failed to open stdout file: %v", err)
+	}
+	defer stdoutFile.Close()
+
+	stderrFile, err := os.OpenFile("/tmp/stderr.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		log.Fatalf("failed to open stderr file: %v", err)
+	}
+	defer stderrFile.Close()
+
+	// 2b. Build command
+	cmd := exec.Command(cmdPath, cmdArgs...)
+	cmd.Stdout = stdoutFile
+	cmd.Stderr = stderrFile
+	cmd.Stdin = nil
+	cmd.Env = []string{"PATH=/bin:/usr/bin"}
+
+	// 3. Set jail + priv drop + cgroup integration
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		UseCgroupFD: true,
+		CgroupFD:    cfd, // directory FD for cgroup
+
+		Chroot: "/opt/jobroot", // must exist & have /bin, /usr/bin populated
+
+		Credential: &syscall.Credential{
+			Uid: 65534, // nobody
+			Gid: 65534,
+		},
+
+		Pdeathsig: syscall.SIGKILL, // kill child if parent dies
+		Setpgid:   true, // set process group ID to its own PID
+	}
+
+	// 4. Start the process
+	if err := cmd.Start(); err != nil {
+		log.Fatalf("failed to start target: %v", err)
+	}
+
+	// 5. Wait for completion
+	if err := cmd.Wait(); err != nil {
+		log.Fatalf("job failed: %v", err)
+	}
+    // 5b. cleanup cgroup
+    ...
+
 ```
-
-4. **Init Binary Responsibilities** – Once started, the init binary will:
-- Write its own PID to `/sys/fs/cgroup/jobs/<jobid>/cgroup.procs` to join the cgroup immediately.
-- Set up the environment, drop privileges, and set process group ID.
-- Use `exec.Command` and `cmd.Start()` with the target command so it runs entirely inside the cgroup from its first instruction in a chroot jail.
-```go
-//This is where the actual restrictions happen — chroot, drop privileges, set PGID, death signal.
-    cgroupPath := "/sys/fs/cgroup/jobs/" + os.Args[1] // cgroup path will just be /sys/fs/cgroup/jobs/<jobid>
-    cmdPath := os.Args[2]
-    cmdArgs := os.Args[3:]
-
-    // 1. Add *this* wrapper PID to cgroup immediately
-    pid := os.Getpid()
-    procsFile := cgroupPath + "/cgroup.procs"
-    if err := os.WriteFile(procsFile, []byte(fmt.Sprintf("%d\n", pid)), 0644); err != nil {
-        log.Fatalf("failed to add PID to cgroup: %v", err)
-    }
-
-    // 2. Prepare target process
-    newRoot := "/opt/jobroot"
-    uid := uint32(65534) // nobody
-    gid := uint32(65534)
-
-    cmd := exec.Command(cmdPath, cmdArgs...)
-    cmd.Env = []string{"PATH=/bin:/usr/bin"}
-    cmd.Stdout = os.Stdout
-    cmd.Stderr = os.Stderr
-    cmd.Stdin = nil
-
-    cmd.SysProcAttr = &syscall.SysProcAttr{
-        Chroot:     newRoot, // chroot jail
-        Credential: &syscall.Credential{Uid: uid, Gid: gid}, // drop privileges
-        Setpgid:    true, // new process group
-        // Ensure child is killed if this init process dies
-        Pdeathsig:  syscall.SIGKILL, // send SIGKILL to child if parent dies
-    }
-
-    // 3. Start target (fork + exec inside jail)
-    if err := cmd.Start(); err != nil {
-        log.Fatalf("failed to start target: %v", err)
-    }
-
-```
-
-5. **Supervision** – The main process can then monitor the job and capture its exit code.
 
 ##### Security note about Start()
 - The **only** environment variable that will be set is `PATH` to a safe value. This is to prevent any potential PATH injection attacks. The `PATH` will be set to a safe value like `/usr/bin:/bin` or similar.
 
 #### Key Subcomponents: (other potential packages)
-- `devinfo`: A helper to provide device info. Like what /dev to set the IO cgroup limits on. This will be determined by grabbing the device where the root (/) dir is mounted.  (ie. /dev/sda might be 8:0)
+- `devinfo`: A helper to provide device info. Like what /dev to set the IO cgroup limits on. This will be determined by grabbing the device where `/opt` directory is mounted.  (ie. /dev/sda might be `8:0`)
 - `cgroups`: Actually creates and deletes cgroups v2 limits (implementation described below)
 - `resources`: A helper package to abstract away all the many low level resource requirements (TBD if needed)
 
 ### 3. Cgroups
 
 ##### Notes
-- Cgroups v2 will be used. Kernel version 5.2+ is required for this functionality
+- Cgroups v2 will be used. Linux Kernel 5.7+ is required for this functionality
+  - This custom implementation of cgroups will **only** work with Linux Kernel 5.7+ as `CLONE_INTO_CGROUP` is required for the `UseCgroupFD` to work properly. (zero time a process runs outside of the cgroup)
 - Upon job termination the Job Controller via `joblib` will cleanup the cgroup files
 - I have provided a mapping of the CLI limit flags to the cgroup files below
   - `Period` is fixed at `100000µs` (100ms) for CPU limits
   - `Quota` is calculated based on the CLI flag value, which is in milli-cores (m) or whole cores (2, 4, etc.) or even `max` for unlimited.
   - `Memory` is set in bytes, so `100M` will be `104857600` bytes.
-- `IO` limits are set based on the device major and minor numbers, which will be determined by the device where the root (/) directory is mounted on. The format is `<major>:<minor> rbps=<readBps> wbps=<writeBps>`. For example, `8:0 rbps=1048576 wbps=1048576` for 1MB/s read and write.
+- `IO` limits are set based on the device major and minor numbers, which will be determined by the device where the `/opt` directory is mounted on. The format is `<major>:<minor> rbps=<readBps> wbps=<writeBps>`. For example, `8:0 rbps=1048576 wbps=1048576` for 1MB/s read and write.
 - `wbps` and `rbps` will be mapped from the CLI flag values like `low`, `med`, `high` to specific values:
   - `low` -> `1M/s` read & write
   - `med` -> `10M/s` read & write
@@ -385,10 +413,9 @@ if err := cmd.Start(); err != nil {
   - set `cpu.max` to "<quota> <period>" where they are in microseconds. (2 tokens)
     - cpu.max is written as "<quota> <period>" in microseconds. Typical period is 100000µs (100ms), and quota ≤ period.
   - set `io.max` to "<device> <rbps> <wbps>" (3 tokens). An example: `8:0 rbps=1048576 wbps=1048576`
-    - Note: The major(8) and minor(0) will try to be determined based on device where the root(/) directory is mounted on.
-3. The init binary will write the child PID to `/sys/fs/cgroup/jobs/<jobid>/cgroup.procs`.
-4. If the process stopped, write `1` to `/sys/fs/cgroup/jobs/<jobid>/cgroup.kill` to forcefully kill the process and remove the cgroup.
-5. When the process exits or is stopped, delete the cgroup directory `/sys/fs/cgroup/jobs/<jobid>`.
+    - Note: The major(8) and minor(0) will try to be determined based on device where the `/opt` directory is mounted on.
+3. If the process stopped, write `1` to `/sys/fs/cgroup/jobs/<jobid>/cgroup.kill` to forcefully kill the processes in the cgroup
+4. When the process exits or is stopped, the cgroup directory `/sys/fs/cgroup/jobs/<jobid>` will be deleted.
 
 
 ### Flag to Cgroup Limit Mapping
@@ -452,6 +479,9 @@ if err := cmd.Start(); err != nil {
 ...
 ```
 
+- Will need to include the dependencies of these binaries as well
+
+---
 ## Testing Strategy
 
 ### Notes
