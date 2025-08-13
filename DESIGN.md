@@ -56,13 +56,12 @@ Implement a secure gRPC-based job worker service that allows clients to start, s
 - Terminate child processes correctly, no orphans or zombies (done via `cgroups` and `setpgid`)
 - Set resource limits (CPU, memory, I/O) using cgroups v2 (manual implementation)
 - Secure gRPC communication via mTLS (strong cipher suites)
-- Simple authorization via client CA
+- Simple authorization via client CA (`CN` for username)
 - CLI utility to interact with server
 - Minimal Unit testing
 - Happy path and common error scenarios integration testing
 - Basic end to end tests
-- Command denylist for normal users, but will run as `nobody` user
-- Same command denylist for admin users and will run as `1000:1000` user
+- Chroot jail limited binaries which processes running as `nobody:nogroup`
 - Job isolation via cgroups and user/group based access control
 - Job metadata management (in memory only for now)
 - Job ID generation (unique, lexicographically sortable)
@@ -85,29 +84,23 @@ Implement a secure gRPC-based job worker service that allows clients to start, s
   - TLS 1.3 only
   - Strong cipher suite (TLS\_AES\_256\_GCM\_SHA384 preferred)
 - **Authorization policy**
-  - In the client certificate itself, `CN` will be the `username` and `O` will be the `role-group`
-  - The role value of `admin-<group>` will be allowed to run any executables **not** on the denylist as user `1000:1000`
-  - The role value of `user-<group>` will be allowed to run commands as user `nobody`
-  - Any members of the same group can perform operations such as stream output from any job as long as they have the job id 
+  - In the client certificate itself, `CN` will be the `username`
+  - A user can **only** can perform operations such as stream output from any job as long as they have the job id 
   - Client CA certificates will be stored in the running server's filesystem rather than in a database, to reduce initial implementation complexity.
 - **Shell invocation**
-  - Avoids shell injection; executes directly with a `exec` style syscall. No shelling out will be permitted. Shell executables will be on the denylist.
+  - Avoids shell injection; Process execution happens via an `init` binary in a chroot jail.
 - **Job isolation**
   - Cgroups used for resource control (custom implementation)
   - Each job gets its own cgroup directory
-  - **Only** users that belong to the same group as the group that created the job id will be able to obtain any data at all from the said job.
 - **DDOS**
   - I will not implement a rate limiting middleware but am aware one would be beneficial to have. This would prevent resource exhaustion. For example, making many connections and just leaving all of them open by starting a TCP handshake but never closing it.
-- **Secure Commands Denylist**
-  - Admin users will be restricted from running certain destructive commands (e.g., `rm`, `mv`, `dd`, etc.) to prevent system damage as well as some simple privilege escalation commands. Normal users will be limited with the same denylist as well.
 - **Logging**
   - The server will maintain logs to disk to keep track of all events and to see who has tried to do what to be able to have visibility 
 ---
 
-
 ## CLI Examples
 ### Streaming Note
-- All the `stream` commands have `tail` like functionality. This means that if the job is still running, the stream will continue to follow the output in real-time. If the job has exited, the stdout and stderr file descriptors will be closed and the stream will end.
+- The `stream` command has `tail` like functionality. This means that if the job is still running, the stream will continue to follow the output in real-time. If the job has exited, the stdout and stderr file descriptors will be closed and the stream will end.
 ### Limits Default
 - If no limits are specified, the job will run with default cgroup limits:
   - CPU: 500m (500 milli-cores)
@@ -115,29 +108,30 @@ Implement a secure gRPC-based job worker service that allows clients to start, s
   - I/O: low
 ```bash
 # Start a job
-jobctl start --cmd "ls / -lah"
+jobctl start ls / -lah
 
 # Start a job with resource limits
-jobctl start \
-  --cmd="echo hello world" \
+# all limits are optional
+jobctl start echo hello world \
   --cpu=500m \
   --mem=100M \
   --io=low
 
 # Stream the output (stdout)
-jobctl stream --id=xxxxxxxx
+# id is required (positional argument)
+jobctl stream  xxxxxxxx
 
 # Stream the output (stderr)
-jobctl stream --id=xxxxxxxx --stderr
-
-# Stream the last output of a currently running job (stdout)
-jobctl stream --id=xxxxxxxx
+# id is required (positional argument), --stderr flag is optional
+jobctl stream xxxxxxxx --stderr
 
 # Get job status
-jobctl status --id=xxxxxxxx
+# id is required (positional argument)
+jobctl status xxxxxxxx
 
 # Stop a job
-jobctl stop --id=xxxxxxxx
+# id is required (positional argument)
+jobctl stop xxxxxxxx
 ```
 
 ---
@@ -161,8 +155,6 @@ jobctl stop --id=xxxxxxxx
   ```
   {
     "user": "bob",
-    "role": "admin|user",
-    "group": "team1",
     "status": "Exited",
     "exit_code": 0
   }
@@ -186,6 +178,7 @@ jobctl stop --id=xxxxxxxx
     jobsLocation = `/var/lib/jobs`
     safePATH = `/usr/bin:/bin`
     port = `50051`
+    chrootRoot = `/opt/jobroot`
 ```
 - Job ID
   - 16 character length alphanumeric ascii string.
@@ -288,8 +281,8 @@ func randomString(n int) string {
 
 | Function             | Description                                             |
 | -------------------- | ------------------------------------------------------- |
-| `Start()`            | Starts a process via setpgid(), takes in an executable and args. Sets job status, cgroup limits and executes the process. See **Start** for details.  It also sets up the process' stdout and stderr and to be read from and written to files on disk. These file names should map up to the job id assigned and also on disk as well. Then wait for job to finish, or be terminated, get its exit status and set it job status as well.
-| `Stop()`             | Sends `SIGTERM` to the process group for as an initial try. If the process (or children) is still running after the timeout, it writes `1` to `/sys/fs/cgroup/jobs/<jobid>/cgroup.kill` to forcefully terminate it and remove the cgroup.
+| `Start()`            | Generates job id, sets a up cgroup, launches an init binary which moves its `pid` into the `cgroup` and uses  replacing itself with the actual target command and args. Then it waits for process to finish, or be terminated, get its exit status and set it job status as well.
+| `Stop()`             | Has cgroup library write `1` to `/sys/fs/cgroup/jobs/<jobid>/cgroup.kill` to forcefully terminate and remove the cgroup.
 | `Status()`           | Return the job status response 
 | `GetStatusResponse()`| Returns a structured status response with job ID, current state (running, exited, etc.), and exit code (if available). Used by both CLI and gRPC server.
 
@@ -297,39 +290,69 @@ func randomString(n int) string {
 
 ##### Start (Launching an actual process)
 - The `Start()` function will take in a command and its arguments, along with resource limits. It will then:
-  - Generate a unique job ID
-  - Create a cgroup for the job and apply resource limits
-  - Create a new process using `syscall.ForkExec()` with the following attributes:
-    - `ProcAttr.Env` = `[]string{safePATH}` (set a safe PATH for the job)
-    - `SysProcAttr.Setpgid` = true (start as its own process group leader).
-    - `SysProcAttr.Pdeathsig` = SIGKILL (if the supervisor dies, the child is killed).
-    - `SysProcAttr.Credential` = {Uid,Gid} set to `nobody` for normal users or `1000:1000` for `admin`.
-    - Set up stdout and stderr to write to `/var/lib/jobs/<jobid>/stdout.log` and `/var/lib/jobs/<jobid>/stderr.log`
-      - ProcAttr.Files = []uintptr{stdinFD, stdoutFD, stderrFD} mapping FD 0/1/2 to:
-        - stdin: `/dev/null`
-        - stdout: `<jobdir>/stdout.log`
-        - stderr: `<jobdir>/stderr.log`
-  - Immediately move the process to the cgroup by writing its PID to `/sys/fs/cgroup/jobs/<jobid>/cgroup.procs`
-  - Wait for the processes to finish, capturing its exit code
 
+1. **Set Up Cgroup** – Create the job’s cgroup and apply resource limits.
+
+2. **Setup and Launch Init Binary**
+  - Use exec.Command to setup/start a small `init` helper binary 
 ```go
-	attr := &syscall.ProcAttr{
-		Env:   []string{safePATH},
-		Files: []uintptr{devNull.Fd(), stdout.Fd(), stderr.Fd()},
-		Sys: &syscall.SysProcAttr{
-			Setpgid:    true, // Start as its own process group leader
-			Pdeathsig:  syscall.SIGKILL, // If the supervisor dies, the child is killed
-            // Set the user and group to `nobody` for normal users or `1000:1000` for admin users
-			Credential: &syscall.Credential{Uid: uid, Gid: gid},
-		},
-	}
+//Supervisor (parent process)
+//Just starts the wrapper and handles logging; no sandboxing here because the wrapper will do it.
+cmd := exec.Command("/usr/local/bin/init-wrapper", append([]string{jobId, targetCmd}, args...)...)
+cmd.Env = []string{"PATH=/bin:/usr/bin"}
+cmd.Stdout = os.Stdout
+cmd.Stderr = os.Stderr
+cmd.Stdin = nil
 
-	argv := append([]string{fullPath}, cmdArgs...)
-	pid, err := syscall.ForkExec(fullPath, argv, attr)
-    // argv is the command and its arguments
-    // if the command is `ls` then we will need to use `exec.LookPath("ls")` to get the full path to the executable
-    // not shown here for brevity
+if err := cmd.Start(); err != nil {
+	log.Fatalf("failed to start job: %v", err)
+}
 ```
+
+4. **Init Binary Responsibilities** – Once started, the init binary will:
+- Write its own PID to `/sys/fs/cgroup/jobs/<jobid>/cgroup.procs` to join the cgroup immediately.
+- Set up the environment, drop privileges, and set process group ID.
+- Use `exec.Command` and `cmd.Start()` with the target command so it runs entirely inside the cgroup from its first instruction in a chroot jail.
+```go
+//This is where the actual restrictions happen — chroot, drop privileges, set PGID, death signal.
+    cgroupPath := "/sys/fs/cgroup/jobs/" + os.Args[1] // cgroup path will just be /sys/fs/cgroup/jobs/<jobid>
+    cmdPath := os.Args[2]
+    cmdArgs := os.Args[3:]
+
+    // 1. Add *this* wrapper PID to cgroup immediately
+    pid := os.Getpid()
+    procsFile := cgroupPath + "/cgroup.procs"
+    if err := os.WriteFile(procsFile, []byte(fmt.Sprintf("%d\n", pid)), 0644); err != nil {
+        log.Fatalf("failed to add PID to cgroup: %v", err)
+    }
+
+    // 2. Prepare target process
+    newRoot := "/opt/jobroot"
+    uid := uint32(65534) // nobody
+    gid := uint32(65534)
+
+    cmd := exec.Command(cmdPath, cmdArgs...)
+    cmd.Env = []string{"PATH=/bin:/usr/bin"}
+    cmd.Stdout = os.Stdout
+    cmd.Stderr = os.Stderr
+    cmd.Stdin = nil
+
+    cmd.SysProcAttr = &syscall.SysProcAttr{
+        Chroot:     newRoot, // chroot jail
+        Credential: &syscall.Credential{Uid: uid, Gid: gid}, // drop privileges
+        Setpgid:    true, // new process group
+        // Ensure child is killed if this init process dies
+        Pdeathsig:  syscall.SIGKILL, // send SIGKILL to child if parent dies
+    }
+
+    // 3. Start target (fork + exec inside jail)
+    if err := cmd.Start(); err != nil {
+        log.Fatalf("failed to start target: %v", err)
+    }
+
+```
+
+5. **Supervision** – The main process can then monitor the job and capture its exit code.
 
 ##### Security note about Start()
 - The **only** environment variable that will be set is `PATH` to a safe value. This is to prevent any potential PATH injection attacks. The `PATH` will be set to a safe value like `/usr/bin:/bin` or similar.
@@ -339,11 +362,20 @@ func randomString(n int) string {
 - `cgroups`: Actually creates and deletes cgroups v2 limits (implementation described below)
 - `resources`: A helper package to abstract away all the many low level resource requirements (TBD if needed)
 
-#### Cgroups
+### 3. Cgroups
 
 ##### Notes
 - Cgroups v2 will be used. Kernel version 5.2+ is required for this functionality
 - Upon job termination the Job Controller via `joblib` will cleanup the cgroup files
+- I have provided a mapping of the CLI limit flags to the cgroup files below
+  - `Period` is fixed at `100000µs` (100ms) for CPU limits
+  - `Quota` is calculated based on the CLI flag value, which is in milli-cores (m) or whole cores (2, 4, etc.) or even `max` for unlimited.
+  - `Memory` is set in bytes, so `100M` will be `104857600` bytes.
+- `IO` limits are set based on the device major and minor numbers, which will be determined by the device where the root (/) directory is mounted on. The format is `<major>:<minor> rbps=<readBps> wbps=<writeBps>`. For example, `8:0 rbps=1048576 wbps=1048576` for 1MB/s read and write.
+- `wbps` and `rbps` will be mapped from the CLI flag values like `low`, `med`, `high` to specific values:
+  - `low` -> `1M/s` read & write
+  - `med` -> `10M/s` read & write
+  - `high` -> unlimited (`rbps=0 wbps=0`)
 
 #### Details
 1. Create a custom cgroup directory `/sys/fs/cgroup/jobs/<jobid>`
@@ -354,21 +386,31 @@ func randomString(n int) string {
     - cpu.max is written as "<quota> <period>" in microseconds. Typical period is 100000µs (100ms), and quota ≤ period.
   - set `io.max` to "<device> <rbps> <wbps>" (3 tokens). An example: `8:0 rbps=1048576 wbps=1048576`
     - Note: The major(8) and minor(0) will try to be determined based on device where the root(/) directory is mounted on.
-3. Immediately after `ForkExec` returns (in the parent), write the child PID to `/sys/fs/cgroup/jobs/<jobid>/cgroup.procs`.
-4. When the process exits, delete the cgroup directory `/sys/fs/cgroup/jobs/<jobid>`.
-5. If the process is still running, write `1` to `/sys/fs/cgroup/jobs/<jobid>/cgroup.kill` to forcefully kill the process and remove the cgroup.
+3. The init binary will write the child PID to `/sys/fs/cgroup/jobs/<jobid>/cgroup.procs`.
+4. If the process stopped, write `1` to `/sys/fs/cgroup/jobs/<jobid>/cgroup.kill` to forcefully kill the process and remove the cgroup.
+5. When the process exits or is stopped, delete the cgroup directory `/sys/fs/cgroup/jobs/<jobid>`.
 
 
-### 3. `server` (gRPC API)
+### Flag to Cgroup Limit Mapping
 
-- Implements:
-  - `StartJob` (takes command, resource limits)
-  - `StopJob`
-  - `GetStatus`
-  - `StreamOutput` (streaming gRPC)
-- Secures:
-  - mTLS setup using TLS 1.3
-  - authorization done via CA. O=admin|user
+| CLI Flag          | Cgroup Controller / File                                   | Value Mapping Rules |
+|-------------------|------------------------------------------------------------|----------------------|
+| `--cpu=<value>`   | `cpu.max`                                                  | **Period:** fixed at `100000` µs (100ms)<br>**Quota:** calculated from `<value>`:<br> `"max"` -> `"max"` (unlimited)<br> `"500m"` -> `(period * 0.5)` = `50000`<br> `"2"` -> `(period * 2)` = `200000`    |
+| `--memory=<value>`| `memory.max`                                               | `<value>` in bytes<br> `"max"` -> `"max"` (unlimited) |
+| `--io=<profile>`  | `io.max`                                                   | `<major>:<minor> rbps=<readBps> wbps=<writeBps>`<br> `"low"` -> `1M/s` read & write<br> `"med"` -> `10M/s` read & write<br> `"high"` -> unlimited (`rbps=0 wbps=0`) |
+
+
+### Example Mappings
+
+| Flag Example            | cgroup v2 Setting(s) |
+|-------------------------|------------------------------------------|
+| `--cpu=500m`            | `cpu.max = 50000 100000`                 |
+| `--cpu=max`             | `cpu.max = max 100000`                   |
+| `--memory=268435456`    | `memory.max = 268435456`                 |
+| `--io=low`              | `io.max = 8:0 rbps=1048576 wbps=1048576` |
+| `--io=high`             | `io.max = 8:0 rbps=0 wbps=0`             |
+
+
 
 ### 4. `CLI` (JobCtl)
 
@@ -376,41 +418,39 @@ func randomString(n int) string {
 - gRPC TLS client with `x509` cert loading
 - Usage is listed above
 - On `StreamOutput`, the CLI will read and when the end of the stream is reached, it will stop reading and exit. If the job is still running, it will continue to read in real-time until the job exits or the user interrupts the stream.
+- The CLI will need to have a config to indicate the client `username` at a minimum. 
 
 
 ### 5. AuthN/Z
 - The client must authenticate the server **and** the server must authenticate the client. This means that the client **and** the server must trust each other via CA's. For simplicity, the server will have the client's CA's when running.
 - `CN` will be used for `<username>`
-- `O` will be used for `<role>-<group>`
-- Process streaming or getting statuses, reading, will be limited to members of any said group. This will be for isolation purposes.
-- Depending on the `role` (admin|user) , the running of particular commands will be limited.
+- Process streaming or getting statuses, reading of any job will be limited to each user.
 
-#### NOTE: All lists will be hardcoded in the implementation
+#### mTLS Certificate Trust & Selection Summary
 
-### Denylist for `admin` users and normal users
-```bash
-rm              # delete files, including /
-mv              # move critical system files
-cp              # copy files into critical places
-dd              # raw disk access
-reboot
-shutdown
-halt
-poweroff
-sudo
-su
-gdb
-sh
-bash
-zsh
-ksh
-csh
-fish
-```
-#### Final Protection Notes
-- This Admin denylist is very basic and is meant to only cover the most common destructive commands. It is not exhaustive by any means. Since `admin` users will run as `1000:1000`, they still could potentially run commands that could destroy the system, but this is a safeguard against the most common ones. (privelege escalation, file deletion, etc.)
-- Setting cgroups for all jobs will be done so I can better limit potential abuse (limit blast radius of a malicious job)
+| Component | How It Knows What to Trust | How It Selects Which Cert to Use |
+|-----------|----------------------------|-----------------------------------|
+| **Server** | - Loads **trusted client CA certificates** from a fixed location on disk.(`ca.crt`)<br>- Configured with `ClientAuth: RequireAndVerifyClientCert`.<br>- Verifies presented client cert chains to a trusted CA and is valid (expiry, key usage). | *Not applicable* — server only verifies client certs. |
+| **CLI Client** | - Loads **server CA certificate** from fixed location on disk.(`ca.crt`)<br>- Uses this to verify the server’s certificate during TLS handshake. | - Loads **its own client certificate** (`.../bob/client.crt`) and private key (`.../bob/client.key`) from fixed, hardcoded paths.<br>- The CN in the cert acts as the `username` for AuthZ.<br>- Always uses the same keypair for all requests. |
+
+**Notes:**
+- All trust material is **static**
+- `CN` in the client certificate = `username`
+- Trust is based solely on local CA files.
+##### NOTE: All lists will be hardcoded in the implementation
 ---
+### Limited list of binaries for chroot jail
+#### Will allow more in the future
+```bash
+/bin/ls
+/bin/echo
+/bin/cat
+/bin/sleep
+/bin/date
+...
+...
+...
+```
 
 ## Testing Strategy
 

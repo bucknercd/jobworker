@@ -6,44 +6,68 @@ option go_package = "github.com/bucknercd/jobworker/proto/gen/jobpb;jobpb";
 
 // ================= Enums =================
 
+// Execution status for a job.
+// Matches internal server statuses: UNKNOWN, RUNNING, EXITED, STOPPED, FAILED.
 enum JobStatus {
-  JOB_STATUS_UNSPECIFIED = 0;
+  JOB_STATUS_UNSPECIFIED = 0; // Unknown or not yet set
   JOB_STATUS_RUNNING     = 1;
   JOB_STATUS_EXITED      = 2;
   JOB_STATUS_STOPPED     = 3;
   JOB_STATUS_FAILED      = 4;
 }
 
+// Output target to stream.
+// Defaults to STDOUT if not set.
+enum StreamTarget {
+    STDOUT = 0;
+    STDERR = 1;
+}
+
 // ================= Limits =================
-// If fields are empty, the server applies its DEFAULT limits.
-// Examples:
-//   cpu        = "500m"            // millicores
-//   memory_max = "100M"            // bytes w/ suffix
-//   io_class   = "low" | "med" | "high"
+//
+// Units and accepted forms:
+//   cpu         = "500m" (millicores), "2" (whole cores), "max" (unlimited)
+//   memory_max  = "100M" (bytes w/ suffix), "max" (unlimited)
+//   io_class    = "low" | "med" | "high"
+//
+// Mapping to cgroups v2 (see design doc for full table):
+//   --cpu=<val>   -> cpu.max
+//   --memory=<val> -> memory.max
+//   --io=<profile> -> io.max
 message ResourceLimits {
-  string cpu         = 1; // e.g. "500m"
-  string memory_max  = 2; // e.g. "100M"
-  string io_class    = 3; // e.g. "low"
+  string cpu         = 1;
+  string memory_max  = 2;
+  string io_class    = 3;
 }
 
 // ================= Requests / Responses =================
 
+// Metadata about a job.
+// AuthZ note: `user`, `role`, and `group` are derived from the client mTLS cert
+// (CN, OUs) — clients cannot set these values directly.
 message JobMetadata {
-  string    user      = 1;
-  string    role      = 2;
-  string    group     = 3;
-  JobStatus status    = 4;
-  int32     exit_code = 5; // present when status is EXITED/FAILED
+  string    user      = 1; // From mTLS CN
+  JobStatus status    = 2;
+  int32     exit_code = 3; // Set if status = EXITED or FAILED
 }
 
+// Starts a new job.
+// The executable will run inside a chroot jail with a safe PATH (/usr/bin:/bin),
+// dropped privileges (nobody:nogroup by default), and cgroup v2 resource limits.
+// The executable may be absolute or resolved from the safe PATH.
 message StartJobRequest {
-  string           executable = 1;            // "ls" or "/usr/bin/ls"
-  repeated string  args       = 2;            // ["-lah", "/"]
-  ResourceLimits   limits     = 3;            // empty => apply server defaults
+  string           executable = 1;           // e.g. "ls" or "/usr/bin/ls"
+  repeated string  args       = 2;           // e.g. ["-lah", "/"]
+  ResourceLimits   limits     = 3;           // Empty => apply server defaults
 }
 
+// Response with the generated job ID.
+// Format: 16-character lowercase [a-z0-9], lexicographically sortable:
+//   first 6 = fixed-width base36 Unix timestamp (rightmost if longer),
+//   last 10 = crypto-random chars.
+// Example: "0abcde1234567890"
 message StartJobResponse {
-  string job_id = 1; // 8-char, lexicographically sortable
+  string job_id = 1;
 }
 
 message StopJobRequest {
@@ -51,8 +75,7 @@ message StopJobRequest {
 }
 
 message StopJobResponse {
-  string      job_id   = 1;
-  JobMetadata metadata = 2;
+  JobMetadata metadata = 1;
 }
 
 message GetStatusRequest {
@@ -64,18 +87,21 @@ message GetStatusResponse {
   JobMetadata metadata = 2;
 }
 
-// ================= Streaming (no offsets; always from beginning) =================
+// ================= Streaming =================
 //
-// Server streams bytes from the beginning of the selected stream (stdout by default)
-// and continues in real-time until the writer closes the FD (job exit) or the call ends.
-
+// Server streams from the beginning of the selected output (stdout by default)
+// and continues in real-time until the writer closes the FD (job exit) or the
+// call ends. Replay is supported even after job exit — output persists on disk
+// until TTL expiry.
+//
+// Multiple clients may stream the same job concurrently.
 message StreamOutputRequest {
   string job_id        = 1;
-  bool   stream_stderr = 2; // false (default) = stdout, true = stderr
+  StreamTarget target  = 2; // Optional; defaults to STDOUT
 }
 
 message StreamOutputResponse {
-  bytes  chunk                   = 1; // up to server chunk size (e.g., 32KB)
+  bytes  chunk         = 1; // Up to server chunk size (e.g., 32KB)
 }
 
 // ================= Service =================
@@ -88,7 +114,6 @@ message StreamOutputResponse {
 //   RESOURCE_EXHAUSTED   guardrails hit (max jobs, etc.)
 //   UNAVAILABLE          service not ready/backpressure
 //   INTERNAL             unexpected server error
-
 service JobWorker {
   rpc StartJob     (StartJobRequest)      returns (StartJobResponse);
   rpc StopJob      (StopJobRequest)       returns (StopJobResponse);
