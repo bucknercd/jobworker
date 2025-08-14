@@ -61,7 +61,7 @@ Implement a secure gRPC-based job worker service that allows clients to start, s
 - Minimal Unit testing
 - Happy path and common error scenarios integration testing
 - Basic end to end tests
-- Chroot jail limited binaries which processes running as `nobody:nogroup`
+- All processes running as `nobody:nogroup`
 - Job isolation via cgroups and user/group based access control
 - Job metadata management (in memory only for now)
 - Job ID generation (unique, lexicographically sortable)
@@ -88,7 +88,7 @@ Implement a secure gRPC-based job worker service that allows clients to start, s
   - A user can **only** can perform operations such as stream output from any job as long as they have the job id 
   - Client CA certificates will be stored in the running server's filesystem rather than in a database, to reduce initial implementation complexity.
 - **Shell invocation**
-  - Avoids shell injection; Process execution happens in a chroot jail.
+  - No use of shells to run commands; Direct process execution
 - **Job isolation**
   - Cgroups used for resource control (custom implementation)
   - Each job gets its own cgroup directory
@@ -187,7 +187,6 @@ Failed = process exited with non-zero code or setup error
     # general
     jobsLocation = `/var/lib/jobs`
     port = `50051`
-    chrootRoot = `/opt/jobroot`
 ```
 - Job ID
   - will use UUIDv7 (36 character length alphanumeric ascii string) 
@@ -279,7 +278,7 @@ func main() {
 
 | Function             | Description                                             |
 | -------------------- | ------------------------------------------------------- |
-| `Start()`            | Creates a cgroup via `cgroup` library, sets up the command with resource limits, and starts the process in a chroot jail. It will also handle logging to stdout/stderr files. The function will return a job ID.
+| `Start()`            | Creates a cgroup via `cgroup` library, sets up the command with resource limits, and starts the process. It will also handle logging to stdout/stderr files. The function will return a job ID.
 | `Stop()`             | Has cgroup library write `1` to `/sys/fs/cgroup/jobs/<jobid>/cgroup.kill` to forcefully terminate and then remove the cgroup.
 | `GetStatusResponse()`| Returns a structured status response with job ID, current state (running, exited, etc.), and exit code (if available). Used by both CLI and gRPC server.
 
@@ -304,13 +303,12 @@ func main() {
 
 3. **Use SysProcAttr to set up the child process**
   - Set `UseCgroupFD` to true and pass the cgroup file descriptor
-  - Set `Chroot` to the chroot jail directory (e.g., `/opt/jobroot`)
   - Set `Credential` to drop privileges to `nobody:nogroup` (uid/gid 65534)
   - Set `Pdeathsig` to `SIGKILL` to ensure the child is killed if the parent dies
   - Set `Setpgid` to true to set the process group ID to its own PID
 
 3. **Start the Process**
-   - Use `cmd.Start()` to start the process in the cgroup and chroot jail
+   - Use `cmd.Start()` to start the process in the cgroup
 
 4. **Supervision**
    - Wait for the child process to exit and capture its exit status.
@@ -353,10 +351,9 @@ func main() {
 		UseCgroupFD: true,
 		CgroupFD:    cfd, // directory FD for cgroup
 
-		Chroot: "/opt/jobroot", // must exist & have /bin, /usr/bin populated
-
+        // Drop privileges to nobody:nogroup
 		Credential: &syscall.Credential{
-			Uid: 65534, // nobody
+			Uid: 65534,
 			Gid: 65534,
 		},
 
@@ -459,22 +456,6 @@ func main() {
 - All trust material is **static**
 - `CN` in the client certificate = `username`
 - Trust is based solely on local CA files.
-##### NOTE: All lists will be hardcoded in the implementation
----
-### Limited list of binaries for chroot jail
-#### Will allow more in the future
-```bash
-/bin/ls
-/bin/echo
-/bin/cat
-/bin/sleep
-/bin/date
-...
-...
-...
-```
-
-- Will need to include the dependencies of these binaries as well
 
 ---
 ## Testing Strategy
