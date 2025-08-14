@@ -186,7 +186,6 @@ Failed = process exited with non-zero code or setup error
 
     # general
     jobsLocation = `/var/lib/jobs`
-    safePATH = `/usr/bin:/bin`
     port = `50051`
     chrootRoot = `/opt/jobroot`
 ```
@@ -282,7 +281,6 @@ func main() {
 | -------------------- | ------------------------------------------------------- |
 | `Start()`            | Creates a cgroup via `cgroup` library, sets up the command with resource limits, and starts the process in a chroot jail. It will also handle logging to stdout/stderr files. The function will return a job ID.
 | `Stop()`             | Has cgroup library write `1` to `/sys/fs/cgroup/jobs/<jobid>/cgroup.kill` to forcefully terminate and then remove the cgroup.
-| `Status()`           | Return the job status response 
 | `GetStatusResponse()`| Returns a structured status response with job ID, current state (running, exited, etc.), and exit code (if available). Used by both CLI and gRPC server.
 
 #### Notes
@@ -302,7 +300,7 @@ func main() {
 
 2. **Build the Command**
     - Open log files for stdout and stderr
-    - Build the command using `exec.Command` with the provided command and arguments using a safe `PATH` environment variable
+    - Build the command using `exec.Command` with the provided command and arguments
 
 3. **Use SysProcAttr to set up the child process**
   - Set `UseCgroupFD` to true and pass the cgroup file descriptor
@@ -349,7 +347,6 @@ func main() {
 	cmd.Stdout = stdoutFile
 	cmd.Stderr = stderrFile
 	cmd.Stdin = nil
-	cmd.Env = []string{"PATH=/bin:/usr/bin"}
 
 	// 3. Set jail + priv drop + cgroup integration
 	cmd.SysProcAttr = &syscall.SysProcAttr{
@@ -380,9 +377,6 @@ func main() {
     ...
 
 ```
-
-##### Security note about Start()
-- The **only** environment variable that will be set is `PATH` to a safe value. This is to prevent any potential PATH injection attacks. The `PATH` will be set to a safe value like `/usr/bin:/bin` or similar.
 
 #### Key Subcomponents: (other potential packages)
 - `devinfo`: A helper to provide device info. Like what /dev to set the IO cgroup limits on. This will be determined by grabbing the device where `/opt` directory is mounted.  (ie. /dev/sda might be `8:0`)
@@ -452,6 +446,7 @@ func main() {
 - The client must authenticate the server **and** the server must authenticate the client. This means that the client **and** the server must trust each other via CA's. For simplicity, the server will have the client's CA's when running.
 - `CN` will be used for `<username>`
 - Process streaming or getting statuses, reading of any job will be limited to each user.
+- The `CLI` client will need a job id to stream or get status of a job. If the user is not the same as the job creator, the request will be denied.
 
 #### mTLS Certificate Trust & Selection Summary
 
