@@ -442,8 +442,25 @@ func main() {
 ### 5. AuthN/Z
 - The client must authenticate the server **and** the server must authenticate the client. This means that the client **and** the server must trust each other via CA's. For simplicity, the server will have the client's CA's when running.
 - `CN` will be used for `<username>`
+- The client will have the server's CA when running
+- The client will have its own client certificate and private key when running
+- The server will authorize the client based on the `CN` in the client certificate.
+- The server will have a list of allowed users based on the client CA's it has
+- Only users with valid client certificates signed by a trusted CA will be allowed to connect
 - Process streaming or getting statuses, reading of any job will be limited to each user.
 - The `CLI` client will need a job id to stream or get status of a job. If the user is not the same as the job creator, the request will be denied.
+- `Trust Boundary` - All client requests must traverse an mTLS connection and present a valid certificate signed by the server’s trusted CA(s).
+
+#### Auth Flow
+1. Valid user ?
+    - Yes -> proceed
+    - No -> deny connection
+2. Valid job id ?
+    - Yes -> proceed
+    - No -> deny request
+3. Is user the same as job creator ?
+    - Yes -> proceed
+    - No -> deny request
 
 #### mTLS Certificate Trust & Selection Summary
 
