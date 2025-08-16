@@ -4,7 +4,7 @@
 set -e 
 
 # If --clean or -c is passed, remove the generated files and exit
-if [[ "$1" == "--clean" || "$1" == "-c" ]]; then
+if [[ "$1" == "clean" ]]; then
   rm -rf proto/gen
   mkdir -p proto/gen/jobpb
   exit 0

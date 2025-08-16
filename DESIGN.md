@@ -92,6 +92,8 @@ Implement a secure gRPC-based job worker service that allows clients to start, s
 - **Job isolation**
   - Cgroups used for resource control (custom implementation)
   - Each job gets its own cgroup directory
+- **General Hardening**
+  - Each process will run a `chroot jail` with `nobody:nogroup` permissions
 - **DDOS**
   - I will not implement a rate limiting middleware but am aware one would be beneficial to have. This would prevent resource exhaustion. For example, making many connections and just leaving all of them open by starting a TCP handshake but never closing it.
 - **Logging**
@@ -307,10 +309,10 @@ func main() {
   - Set `Pdeathsig` to `SIGKILL` to ensure the child is killed if the parent dies
   - Set `Setpgid` to true to set the process group ID to its own PID
 
-3. **Start the Process**
+4. **Start the Process**
    - Use `cmd.Start()` to start the process in the cgroup
 
-4. **Supervision**
+5. **Supervision**
    - Wait for the child process to exit and capture its exit status.
    - Delete the cgroup directory after the process exits
 
@@ -350,6 +352,7 @@ func main() {
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		UseCgroupFD: true,
 		CgroupFD:    cfd, // directory FD for cgroup
+    Chroot: chrootFD
 
         // Drop privileges to nobody:nogroup
 		Credential: &syscall.Credential{
