@@ -1,3 +1,5 @@
+SHELL := /bin/bash
+
 CERTS_DIR := $(CURDIR)
 CA_KEY := $(CERTS_DIR)/ca.key
 CA_CERT := $(CERTS_DIR)/ca.crt
@@ -6,6 +8,14 @@ SERVER_KEY := $(CERTS_DIR)/server.key
 SERVER_CSR := $(CERTS_DIR)/server.csr
 SERVER_CERT := $(CERTS_DIR)/server.crt
 
+# ---- Configurable SANs ----
+# Default SANs for local dev:
+#   make server
+# Override examples:
+#   make server SERVER_SANS="DNS:jobworker.local,DNS:jobworker"
+#   make server SERVER_SANS="IP:10.0.0.12,DNS:jobworker.internal"
+SERVER_SANS ?= IP:127.0.0.1,DNS:localhost
+# --------------------------
 .PHONY: all server user clean
 
 all: server
@@ -20,14 +30,16 @@ $(CA_KEY) $(CA_CERT):
 
 server: $(CA_KEY) $(CA_CERT)
 	@if [ ! -f $(SERVER_KEY) ]; then \
-		echo ">>> Generating server certs"; \
+		echo ">>> Generating server certs (SANs: $(SERVER_SANS))"; \
 		openssl genrsa -out $(SERVER_KEY) 2048; \
 		openssl req -new -key $(SERVER_KEY) \
 			-subj "/CN=mtls-server" \
+			-addext "subjectAltName=$(SERVER_SANS)" \
 			-out $(SERVER_CSR); \
 		openssl x509 -req -in $(SERVER_CSR) \
 			-CA $(CA_CERT) -CAkey $(CA_KEY) -CAcreateserial \
-			-out $(SERVER_CERT) -days 365 -sha256; \
+			-out $(SERVER_CERT) -days 365 -sha256 \
+			-extfile <(printf "subjectAltName=$(SERVER_SANS)\nkeyUsage=digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth"); \
 		rm $(SERVER_CSR); \
 	else echo ">>> Server certs already exist, skipping."; fi
 

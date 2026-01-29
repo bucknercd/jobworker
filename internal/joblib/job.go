@@ -17,6 +17,10 @@ import (
 type Status int32
 
 const (
+	maxLogDumpBytes = 64 * 1024 // 64KB per stream; tune as you like
+)
+
+const (
 	StatusUnknown Status = iota // Initial state, before job is started
 	StatusStarted               // Job has been started
 	StatusRunning               // Job is currently running
@@ -138,7 +142,7 @@ func (j *Job) Start() error {
 	j.cmd.SysProcAttr = &syscall.SysProcAttr{
 		UseCgroupFD: true,
 		CgroupFD:    cgroupFD, // directory FD for cgroup
-		Chroot:      chrootDir,
+		//Chroot:      chrootDir,  // Not chroot for now; can enable later
 
 		// Drop privileges to nobody:nogroup
 		Credential: &syscall.Credential{
@@ -155,6 +159,32 @@ func (j *Job) Start() error {
 		}
 		return j.failStart("failed to start target", exitCodeFailedToStart, StatusFailed, err)
 	}
+
+	pid := -1
+	if j.cmd.Process != nil {
+		pid = j.cmd.Process.Pid
+	}
+
+	if snap, err := j.cgManager.Snapshot(); err != nil {
+		j.log.Printf("[cgroup] job=%s snapshot failed: %v", j.id, err)
+	} else {
+		j.log.Printf(
+			"[cgroup] job=%s pid=%d path=%s pids.current=%d procs=%v cpu.max=%q mem.max=%q io.max=%q mem.current=%dB cpu.usage_usec=%d throttled=%d throttled_usec=%d",
+			j.id,
+			pid,
+			snap.Path,
+			snap.PidsCurrent,
+			firstNInts(snap.Procs, 4),
+			snap.CPUMax,
+			snap.MemoryMax,
+			snap.IOMax,
+			snap.MemoryCurrent,
+			snap.CPUStat["usage_usec"],
+			snap.CPUStat["nr_throttled"],
+			snap.CPUStat["throttled_usec"],
+		)
+	}
+
 	if !j.tryTransition(StatusStarted, StatusRunning) {
 		j.log.Printf("job %s was unable to transition to StatusRunning state", j.id)
 	}
@@ -216,9 +246,29 @@ func (j *Job) Stop() error {
 // ===== Private methods =====
 
 func (j *Job) failStart(reason string, code int32, status Status, err error) error {
-	j.tryTransition(StatusUnknown, status)
+	// Force status -> Failed (or whatever 'status' you pass), regardless of current state.
+	j.setStatus(status)
+
 	j.setExitCode(code)
 	j.log.Printf("%s: %v", reason, err)
+
+	// Ensure Waiters don't hang if Start fails before waitForExit goroutine runs
+	j.waitOnce.Do(func() {
+		defer close(j.doneCh)
+
+		// close log files if they were opened
+		if cerr := j.closeLogFiles(); cerr != nil {
+			j.log.Printf("job %s: error closing log files during failStart: %v", j.id, cerr)
+		}
+
+		// best-effort cgroup cleanup
+		if j.cgManager != nil {
+			if derr := j.cgManager.Delete(j.id); derr != nil {
+				j.log.Printf("job %s: cgroup cleanup failed during failStart: %v", j.id, derr)
+			}
+		}
+	})
+
 	return fmt.Errorf("%s: %w", reason, err)
 }
 
@@ -304,14 +354,25 @@ func (j *Job) closeLogFiles() error {
 }
 
 func (j *Job) doWait() {
+	defer close(j.doneCh)
 
+	// If we never started successfully, we still must not hang waiters.
 	if j.Status() != StatusRunning {
-		j.log.Printf("job %s: never made it to StatusRunning", j.id)
+		j.log.Printf("job %s: never made it to StatusRunning (status=%s)", j.id, j.Status())
+
+		// Best-effort cleanup in case we created things before failing.
+		if err := j.closeLogFiles(); err != nil {
+			j.log.Printf("job %s: error closing log files: %v", j.id, err)
+		}
+		if j.cgManager != nil {
+			if err := j.cgManager.Delete(j.id); err != nil {
+				j.log.Printf("job %s: failed to cleanup cgroup: %v", j.id, err)
+			}
+		}
 		return
 	}
 
 	waitErr := j.cmd.Wait()
-	defer close(j.doneCh)
 
 	// Exit handling
 	if waitErr != nil {
@@ -332,18 +393,60 @@ func (j *Job) doWait() {
 			j.setStatus(StatusStopped)
 		}
 	} else {
-		j.setStatus(StatusExited)
+		// If something already marked it failed, don't overwrite.
+		if j.Status() != StatusFailed {
+			j.setStatus(StatusExited)
+		}
 	}
 
 	if err := j.closeLogFiles(); err != nil {
 		j.log.Printf("job %s: error closing log files: %v", j.id, err)
 	}
 
-	if err := j.cgManager.Delete(j.id); err != nil {
-		j.log.Printf("job %s: failed to cleanup cgroup: %v", j.id, err)
+	// Dump stdout/stderr into server logs (streaming not implemented yet)
+	j.dumpLogFileToLogger("STDOUT", j.stdoutPath, maxLogDumpBytes)
+	j.dumpLogFileToLogger("STDERR", j.stderrPath, maxLogDumpBytes)
+
+	if j.cgManager != nil {
+		if err := j.cgManager.Delete(j.id); err != nil {
+			j.log.Printf("job %s: failed to cleanup cgroup: %v", j.id, err)
+		}
 	}
 }
 
 func (j *Job) waitForExit() {
 	j.waitOnce.Do(j.doWait)
+}
+
+func (j *Job) dumpLogFileToLogger(label, path string, maxBytes int64) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		j.log.Printf("job %s: failed to read %s log (%s): %v", j.id, label, path, err)
+		return
+	}
+
+	// Truncate if huge
+	if int64(len(data)) > maxBytes {
+		// Keep tail (usually most useful)
+		data = data[int64(len(data))-maxBytes:]
+		j.log.Printf("job %s: %s log truncated to last %d bytes", j.id, label, maxBytes)
+	}
+
+	// Avoid logging empty output as noise
+	if len(data) == 0 {
+		j.log.Printf("job %s: %s log empty", j.id, label)
+		return
+	}
+
+	// Print with framing. If output has multiple lines, keep it readable.
+	j.log.Printf("job %s: ===== BEGIN %s =====", j.id, label)
+	j.log.Print(string(data)) // log.Print already adds timestamp/prefix
+	j.log.Printf("job %s: ===== END %s =====", j.id, label)
+}
+
+func firstNInts(xs []int, n int) []int {
+	if len(xs) <= n {
+		return xs
+	}
+	return xs[:n]
 }
