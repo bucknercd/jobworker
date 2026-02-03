@@ -181,44 +181,6 @@ func splitArgs(s string) []string {
 	return out
 }
 
-// func buildClientTLSConfig(certsDir, user, addr string) (*tls.Config, error) {
-// 	// client cert
-// 	clientCertPath := filepath.Join(certsDir, user, "client.crt")
-// 	clientKeyPath := filepath.Join(certsDir, user, "client.key")
-// 	clientCert, err := tls.LoadX509KeyPair(clientCertPath, clientKeyPath)
-// 	if err != nil {
-// 		return nil, fmt.Errorf("load client keypair: %w", err)
-// 	}
-
-// 	// trust server CA
-// 	caPath := filepath.Join(certsDir, "ca.crt")
-// 	caPEM, err := os.ReadFile(caPath)
-// 	if err != nil {
-// 		return nil, fmt.Errorf("read ca.crt: %w", err)
-// 	}
-// 	roots := x509.NewCertPool()
-// 	if ok := roots.AppendCertsFromPEM(caPEM); !ok {
-// 		return nil, fmt.Errorf("append ca.crt: no certs found")
-// 	}
-
-// 	host := addr
-// 	// addr might be "host:port"
-// 	if h, _, err := net.SplitHostPort(addr); err == nil {
-// 		host = h
-// 	}
-
-// 	return &tls.Config{
-// 		MinVersion:   tls.VersionTLS13,
-// 		Certificates: []tls.Certificate{clientCert},
-// 		RootCAs:      roots,
-
-// 		// IMPORTANT:
-// 		// Your server cert CN is "mtls-server". If you don't set ServerName,
-// 		// Go may fail verification depending on how you connect.
-// 		ServerName: host,
-// 	}, nil
-// }
-
 func buildClientTLSConfig(certsDir, addr string, insecure bool) (*tls.Config, error) {
 	identityDir, err := discoverIdentityDir(certsDir)
 	if err != nil {
